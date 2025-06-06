@@ -949,17 +949,9 @@ class IsocortexCoordinateProjector:
                 if not appended:
                     depth.append(np.nan)
 
-        if thickness_type == "normalized_layers":
-            ref_total_thickness = np.sum(list(self.layer_thicknesses.values()))
-            depth = np.array(depth) / ref_total_thickness * full_thickness_voxels
-        else:
-            depth = np.array(depth)
-
+        depth = np.array(depth)
         if scale == "microns":
-            if thickness_type == "normalized_layers":
-                depth_microns = depth * ref_total_thickness / full_thickness_voxels
-            else:
-                depth_microns = depth * self.resolution[1]
+            depth_microns = depth * self.resolution[1]
             return depth_microns
         else:
             return depth
