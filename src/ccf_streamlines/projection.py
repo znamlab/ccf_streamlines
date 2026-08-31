@@ -43,6 +43,10 @@ class Isocortex2dProjector:
         the hemispheres adjacent or near adjacent when used with the views of the same name.
         If an integer of value `n`, the right-most `n` voxels will be removed
         before combining both hemispheres to allow the user to customize the spacing.
+    chunk_size : int, default 1000
+        Number of entries read from the volume lookup at a time while ordering
+        the paths to match the view. Reading in chunks keeps peak memory down;
+        the default is suitable for the full-size reference files.
     """
 
     def __init__(self,
@@ -50,11 +54,13 @@ class Isocortex2dProjector:
         surface_paths_file,
         hemisphere="both",
         view_space_for_other_hemisphere=False,
+        chunk_size=1000,
     ):
         if hemisphere not in {"both", "left", "right"}:
             raise ValueError(f"Value of `hemisphere` ({hemisphere}) is not allowed; must be `both`, `left`, or `right`.")
 
         self.hemisphere = hemisphere
+        self.chunk_size = chunk_size
 
         # Load the projection information
         logging.info("Loading projection file")
@@ -99,7 +105,7 @@ class Isocortex2dProjector:
             view_unsorter = np.argsort(view_sorter)
 
             # pull chunks from volume lookup to reduce memory usage
-            chunk_size = 1000
+            chunk_size = self.chunk_size
             sorted_lookup = self.view_lookup[view_sorter, 1]
             path_ind = np.zeros_like(sorted_lookup)
             print("loading path information")
@@ -131,6 +137,10 @@ class Isocortex2dProjector:
         projected_volume : array
             2D projection of input volume
         """
+
+        if kind not in {"max", "min", "mean", "average", "sum"}:
+            raise ValueError(
+                f"`kind` must be 'max', 'min', 'mean', 'average', or 'sum'; was {kind}")
 
         if self.hemisphere == "left":
             projected_volume = self._project_volume_to_view(volume, kind)
@@ -174,14 +184,17 @@ class Isocortex2dProjector:
         if kind == "max":
             # The path specification assumes the first point in the volume is not a
             # valid data point and so should be ignored. Since we are doing a
-            # maximum projection, we set that to the minimum possible value
-            # so that it won't be selected
-            volume.flat[0] = min_val
-            projected_volume.flat[self.view_lookup[:, 0]] = volume.flat[self.paths].max(axis=1)
+            # maximum projection, we set the padded entries to the minimum possible
+            # value so that they won't be selected. The substitution is made in the
+            # gathered copy, so the caller's volume is not modified.
+            values = volume.flat[self.paths]
+            values[self.paths == 0] = min_val
+            projected_volume.flat[self.view_lookup[:, 0]] = values.max(axis=1)
         elif kind == "min":
             # Same thing as above, just set to maximum instead of minimum
-            volume.flat[0] = max_val
-            projected_volume.flat[self.view_lookup[:, 0]] = volume.flat[self.paths].min(axis=1)
+            values = volume.flat[self.paths]
+            values[self.paths == 0] = max_val
+            projected_volume.flat[self.view_lookup[:, 0]] = values.min(axis=1)
         elif kind == "mean" or kind == "average":
             projected_volume.flat[self.view_lookup[:, 0]] = np.nanmean(
                 np.where(self.paths > 0, volume.flat[self.paths], np.nan),
@@ -254,6 +267,9 @@ class Isocortex3dProjector(Isocortex2dProjector):
         the hemispheres adjacent or near adjacent when used with the views of the same name.
         If an integer of value `n`, the right-most `n` voxels will be removed
         before combining both hemispheres to allow the user to customize the spacing.
+    chunk_size : int, default 1000
+        Number of entries read from the volume lookup at a time while ordering
+        the paths to match the view.
     """
     ISOCORTEX_LAYER_KEYS = [
         'Isocortex layer 1',
@@ -272,12 +288,14 @@ class Isocortex3dProjector(Isocortex2dProjector):
         streamline_layer_thickness_file=None,
         hemisphere="both",
         view_space_for_other_hemisphere=False,
+        chunk_size=1000,
     ):
         super().__init__(
             projection_file,
             surface_paths_file,
             hemisphere,
             view_space_for_other_hemisphere,
+            chunk_size,
         )
 
         allowed_thickness_types = {"unnormalized", "normalized_full", "normalized_layers"}
@@ -553,7 +571,7 @@ class BoundaryFinder:
         self.labels_df =  pd.read_csv(
             labels_file,
             header=None,
-            sep="\s+",
+            sep=r"\s+",
             index_col=0
         )
         self.labels_df.columns = ["r", "g", "b", "x0", "x1", "x2", "acronym"]
@@ -639,7 +657,8 @@ class BoundaryFinder:
             region_raster = np.zeros_like(self.proj_atlas).astype(bool)
             region_raster[self.proj_atlas == ind] = True
 
-            region_raster = region_raster[:-view_space_for_other_hemisphere, :]
+            if view_space_for_other_hemisphere > 0:
+                region_raster = region_raster[:-view_space_for_other_hemisphere, :]
             if hemisphere == "left":
                 pass
             elif hemisphere == "right":
@@ -712,6 +731,10 @@ class IsocortexCoordinateProjector:
     projection_file : str, optional
         File path to an HDF5 file containing the 2D projection information.
         If None (default), only depth information can be obtained.
+    chunk_size : int, default 1000
+        Number of entries read from the volume lookup at a time when resolving
+        surface voxels to streamlines. Reading in chunks keeps peak memory
+        down; the default is suitable for the full-size reference files.
     """
 
     ISOCORTEX_LAYER_KEYS = [
@@ -729,9 +752,11 @@ class IsocortexCoordinateProjector:
         layer_thicknesses=None,
         streamline_layer_thickness_file=None,
         resolution=(10, 10, 10),
-        projection_file=None):
+        projection_file=None,
+        chunk_size=1000):
 
         self.layer_thicknesses = layer_thicknesses
+        self.chunk_size = chunk_size
 
         # Load the surface path information
         logging.info("Loading surface path file")
@@ -956,7 +981,9 @@ class IsocortexCoordinateProjector:
         else:
             return depth
 
-    def _path_lookup_chunked(self, indices, chunk_size=1000):
+    def _path_lookup_chunked(self, indices, chunk_size=None):
+        if chunk_size is None:
+            chunk_size = self.chunk_size
         sorter = np.argsort(indices)
         unsorter = np.argsort(sorter)
         sorted_indices = indices[sorter]
@@ -1065,8 +1092,9 @@ class IsocortexCoordinateProjector:
             if min_dist_idx_list:
                 min_dist_idx = np.concatenate(min_dist_idx_list)
             else:
-                # nothing to look up - every matching surface voxel is already
-                # used by the view, so no chunk was processed above
+                # no surface voxels need a nearest-streamline lookup: they are
+                # all already in the view, none matched a surface voxel, or the
+                # input was empty - so no chunk was processed above
                 min_dist_idx = np.zeros(0, dtype=int)
             projected_ind[
                 (matching_surface_voxel_ind != 0) & (projected_ind == -1)
@@ -1201,6 +1229,10 @@ class IsocortexEntireProjector:
         values : array
             Linear array of the result of the operation for each streamline
         """
+        if kind not in {"max", "min", "mean", "average", "sum"}:
+            raise ValueError(
+                f"`kind` must be 'max', 'min', 'mean', 'average', or 'sum'; was {kind}")
+
         if volume.shape != self.volume_shape:
             raise ValueError(
                 f"Input volume must match lookup volume shape; {volume.shape} != {self.volume_shape}")
@@ -1218,14 +1250,17 @@ class IsocortexEntireProjector:
         if kind == "max":
             # The path specification assumes the first point in the volume is not a
             # valid data point and so should be ignored. Since we are doing a
-            # maximum projection, we set that to the minimum possible value
-            # so that it won't be selected
-            volume.flat[0] = min_val
-            values = volume.flat[self.paths].max(axis=1)
+            # maximum projection, we set the padded entries to the minimum possible
+            # value so that they won't be selected. The substitution is made in the
+            # gathered copy, so the caller's volume is not modified.
+            path_values = volume.flat[self.paths]
+            path_values[self.paths == 0] = min_val
+            values = path_values.max(axis=1)
         elif kind == "min":
             # Same thing as above, just set to maximum instead of minimum
-            volume.flat[0] = max_val
-            values = volume.flat[self.paths].min(axis=1)
+            path_values = volume.flat[self.paths]
+            path_values[self.paths == 0] = max_val
+            values = path_values.min(axis=1)
         elif kind == "mean" or kind == "average":
             values = np.nanmean(
                 np.where(self.paths > 0, volume.flat[self.paths], np.nan),
@@ -1253,6 +1288,8 @@ class IsocortexEntireProjector:
             Coordinates of the voxel at the start of each streamline. The order is the same
             as `values`.
         """
+        if scale not in {"voxels", "microns"}:
+            raise ValueError(f"`scale` must be either 'voxels' or 'microns'; was {scale}")
 
         first_voxels = self.paths[:, 0]
         first_voxel_coords = np.unravel_index(
